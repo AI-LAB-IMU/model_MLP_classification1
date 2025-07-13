@@ -28,6 +28,9 @@ class SensorForegroundService : Service(), SensorEventListener {
     private lateinit var predictionLogFile: File
     private lateinit var predictionLogWriter: BufferedWriter
 
+    private lateinit var combinedRawFile: File
+    private lateinit var combinedRawWriter: BufferedWriter
+
     override fun onCreate() {
         super.onCreate()
         createNotification()
@@ -41,7 +44,7 @@ class SensorForegroundService : Service(), SensorEventListener {
         // 모델 로드
         tflite = Interpreter(loadModelFile("model_classification1.tflite"))
 
-        // ✅ 예측 요약 로그 초기화
+        // 예측 로그 초기화
         val dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
         val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.getDefault()).format(Date())
         val predictionLogFilename = "prediction_log_$timestamp.csv"
@@ -49,6 +52,15 @@ class SensorForegroundService : Service(), SensorEventListener {
         predictionLogWriter = BufferedWriter(FileWriter(predictionLogFile, true))
         predictionLogWriter.write("timestamp,window,prediction\n")
         predictionLogWriter.flush()
+
+        // 통합 원본 윈도우 파일 초기화
+        val rawDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+        combinedRawFile = File(rawDir, "raw_windows_combined.csv")
+        val isNewFile = !combinedRawFile.exists()
+        combinedRawWriter = BufferedWriter(FileWriter(combinedRawFile, true))
+        if (isNewFile) {
+            combinedRawWriter.write("window,x,y,z\n")
+        }
     }
 
     private fun loadModelFile(fileName: String): MappedByteBuffer {
@@ -63,6 +75,7 @@ class SensorForegroundService : Service(), SensorEventListener {
         sensorManager.unregisterListener(this)
         tflite.close()
         predictionLogWriter.close()
+        combinedRawWriter.close()
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -107,30 +120,25 @@ class SensorForegroundService : Service(), SensorEventListener {
 
         val prediction = outputBuffer[0].indices.maxByOrNull { outputBuffer[0][it] } ?: -1
 
-        // ✅ 예측 로그 저장
+        // 예측 로그 저장
         val timestamp = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()).format(Date())
         predictionLogWriter.write("$timestamp,$windowCounter,${prediction + 1}\n")
         predictionLogWriter.flush()
 
-        // ✅ raw window 저장 - 안전한 앱 전용 디렉토리 사용
-        val rawFilename = String.format("raw_window_%06d.csv", windowCounter)
-        val rawDir = getExternalFilesDir(Environment.DIRECTORY_DOCUMENTS)
-        val rawFile = File(rawDir, rawFilename)
-        val rawWriter = BufferedWriter(FileWriter(rawFile))
-        rawWriter.write("x,y,z\n")
+        // 원본 윈도우 데이터를 하나의 파일에 누적 저장
         for (data in window) {
-            rawWriter.write("${data[0]},${data[1]},${data[2]}\n")
+            combinedRawWriter.write("$windowCounter,${data[0]},${data[1]},${data[2]}\n")
         }
-        rawWriter.close()
+        combinedRawWriter.flush()
 
-        // ✅ 예측 결과 전송
+        // 예측 결과 전송
         val resultIntent = Intent("com.example.classification_0623.PREDICTION_RESULT")
         resultIntent.putExtra("prediction", prediction + 1)
         resultIntent.putExtra("windowIndex", windowCounter)
         sendBroadcast(resultIntent)
 
         if (prediction == 4) {
-            println("[$windowCounter] 🚨 위험 행동 감지")
+            println("[$windowCounter] 위험 행동 감지")
             val vibrator = getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 vibrator.vibrate(VibrationEffect.createOneShot(1000, VibrationEffect.DEFAULT_AMPLITUDE))
@@ -141,7 +149,6 @@ class SensorForegroundService : Service(), SensorEventListener {
             println("[$windowCounter] 예측 결과 클래스: ${prediction + 1}")
         }
     }
-
 
     override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
 
