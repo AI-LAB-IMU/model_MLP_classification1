@@ -106,8 +106,8 @@ class SensorForegroundService : Service(), SensorEventListener {
             deltaList.standardDeviation()
         )
 
-        val mu = floatArrayOf(13.1613f, 3.3716f, 3.7332f, 4.7952f)
-        val sigma = floatArrayOf(7.2705f, 3.8980f, 4.2321f, 6.3111f)
+        val mu = floatArrayOf(14.5837f, 4.4511f, 5.0434f, 6.4244f)
+        val sigma = floatArrayOf(8.5063f, 4.6254f, 5.1187f, 7.1516f)
 
         val normalizedVector = FloatArray(4) { i ->
             (rawVector[i] - mu[i]) / sigma[i]
