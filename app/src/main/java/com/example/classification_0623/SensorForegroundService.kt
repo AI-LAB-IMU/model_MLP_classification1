@@ -47,7 +47,7 @@ class SensorForegroundService : Service(), SensorEventListener {
         // 예측 로그 초기화
         val dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
         val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.getDefault()).format(Date())
-        val predictionLogFilename = "prediction_log_$timestamp.csv"
+        val predictionLogFilename = "model_MLP_classification_$timestamp.csv"
         predictionLogFile = File(dir, predictionLogFilename)
         predictionLogWriter = BufferedWriter(FileWriter(predictionLogFile, true))
         predictionLogWriter.write("timestamp,window,prediction\n")
