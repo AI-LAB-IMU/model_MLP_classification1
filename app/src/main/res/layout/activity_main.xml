@@ -9,7 +9,7 @@
         android:id="@+id/resultTextView"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:text="분석"
+        android:text="시작 준비"
         android:textSize="18sp"
         android:padding="8dp" />
 
@@ -18,11 +18,13 @@
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
         android:text="서비스 시작"
+        android:backgroundTint="@color/btn_red"
         android:layout_marginBottom="16dp" />
 
     <Button
         android:id="@+id/stopButton"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
+        android:backgroundTint="@color/btn_red"
         android:text="서비스 중단" />
 </LinearLayout>
