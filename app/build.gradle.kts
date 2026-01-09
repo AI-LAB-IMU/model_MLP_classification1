@@ -51,6 +51,7 @@ dependencies {
     implementation ("androidx.wear:wear:1.2.0")
     implementation ("org.tensorflow:tensorflow-lite:2.10.0")
     implementation ("org.tensorflow:tensorflow-lite-support:0.4.3")
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)

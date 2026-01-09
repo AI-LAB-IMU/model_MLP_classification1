@@ -18,6 +18,13 @@ import android.os.VibrationEffect
 import android.os.Vibrator
 import android.util.Log
 import androidx.core.app.NotificationCompat
+import okhttp3.Call
+import okhttp3.Callback
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.Response
 import org.json.JSONArray
 import org.json.JSONObject
 import org.tensorflow.lite.Interpreter
@@ -25,17 +32,18 @@ import java.io.BufferedWriter
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileWriter
+import java.io.IOException
 import java.nio.channels.FileChannel
 import java.text.SimpleDateFormat
-import java.util.Locale
 import java.util.Date
+import java.util.Locale
+import java.util.TimeZone
 import kotlin.math.abs
 import kotlin.math.exp
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.sqrt
 import kotlin.collections.ArrayDeque
-
 
 class SensorForegroundService : Service(), SensorEventListener {
 
@@ -67,11 +75,11 @@ class SensorForegroundService : Service(), SensorEventListener {
 
     // === 보수화 파라미터(기존) ===
     private val TH_P5 = 0.90f
-    private val TH_P4 = 0.70f
+    private val TH_P4 = 0.65f
     private val MARGIN_P5 = 0.30f
-    private val MARGIN_P4 = 0.18f
-    private val GATE_Z_STD   = 0.80f
-    private val GATE_Z_DSTD  = 0.90f
+    private val MARGIN_P4 = 0.15f
+    private val GATE_Z_STD   = 0.75f
+    private val GATE_Z_DSTD  = 0.85f
     private val TH_P3 = 0.50f
     private val MARGIN_P3 = 0.08f
     private val TH_ACTIVITY = 9.85f
@@ -80,23 +88,23 @@ class SensorForegroundService : Service(), SensorEventListener {
     private val TH_ACTIVE_DSTD = 1.2f
 
     // --- 2↔3 보수화(중강도 밴드) ---
-    private val STRONG_P3 = 0.65f
-    private val STRONG_MARGIN_P3 = 0.15f
+    private val STRONG_P3 = 0.60f
+    private val STRONG_MARGIN_P3 = 0.12f
     private val MOD_STD_MIN = 0.30f
     private val MOD_DSTD_MIN = 0.30f
 
     // --- 2↔3 히스테리시스 & 스파이크(“털기/지우기”) 가드 & 간단 스무딩 ---
-    private val HYST_UP_CONSEC = 2      // 3으로 올릴 땐 최소 2 창 연속 충족
-    private val HYST_DOWN_CONSEC = 1    // 2로 내릴 땐 1 창이면 충분
-    private val TH_P3_UP = 0.55f        // 상승 문턱
-    private val TH_P3_DOWN = 0.45f      // 하강 문턱
-    private val MARGIN_P3_UP = 0.10f
+    private val HYST_UP_CONSEC = 1
+    private val HYST_DOWN_CONSEC = 1
+    private val TH_P3_UP = 0.50f
+    private val TH_P3_DOWN = 0.45f
+    private val MARGIN_P3_UP = 0.08f
     private val MARGIN_P3_DOWN = 0.05f
 
-    private val SHAKE_DSTD_HIGH = 1.60f           // x4(d_svm_std) 매우 큼
-    private val SHAKE_MEAN_MAX = TH_ACTIVITY + 0.8f  // 평균 활동은 낮음
-    private val P3_STRONG_MIN = 0.60f             // p3 강증거 기준
-    private val JERK_RATIO_TH = 1.30f             // x4/(x2+eps) 비정상적 비율
+    private val SHAKE_DSTD_HIGH = 1.80f
+    private val SHAKE_MEAN_MAX = TH_ACTIVITY + 0.8f
+    private val P3_STRONG_MIN = 0.60f
+    private val JERK_RATIO_TH = 1.50f
 
     private val recentP = ArrayDeque<FloatArray>()   // 최근 3창 [p1..p5]
     private val recentX = ArrayDeque<FloatArray>()   // 최근 3창 [x1..x4]
@@ -105,13 +113,12 @@ class SensorForegroundService : Service(), SensorEventListener {
     private var consec2Cond = 0
     private var state23 = 2  // 2/3 상태 기억 (초기 2)
 
-    // === 타임스탬프(마이크로초 표기용) ===
+    // === 타임스탬프(마이크로초 표기용: CSV용) ===
     private var baseWallMs: Long = 0L
     private var baseNano: Long = 0L
     private val sdfMillis = SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.getDefault())
 
     // === 100→50 Hz AA FIR + 2:1 디시메이터 ===
-    // Kaiser(β=5.65), fs_in=100 Hz, cutoff≈22.5 Hz, numtaps=91
     private val HB_TAPS = floatArrayOf(
         0.00010228f, -0.00012024f, -0.00024596f, 0.00011137f, 0.00045327f, -0.00000000f, -0.00069560f, -0.00026395f,
         0.00091269f, 0.00071509f, -0.00101310f, -0.00135490f, 0.00088289f, 0.00213500f, -0.00040322f, -0.00294544f,
@@ -128,6 +135,18 @@ class SensorForegroundService : Service(), SensorEventListener {
     )
     private lateinit var decimator: FirDecimator3D
 
+    // ===================== 서버 연동 설정 =====================
+    private val BASE_URL = "http://210.125.91.90:8000"
+    private val IMU_ALERT_PATH = "/api/v1/events/imu-alert"
+    private val protecteeId = "1" // 현재 Django admin에 등록된 Protectee ID
+
+    private val httpClient: OkHttpClient = OkHttpClient()
+
+    private var lastSentLevel = 0
+    private var lastSentAtMs = 0L
+    private val SEND_COOLDOWN_MS = 0L
+    // =========================================================
+
     override fun onCreate() {
         super.onCreate()
         createNotification()
@@ -139,18 +158,15 @@ class SensorForegroundService : Service(), SensorEventListener {
         sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
         accelerometer = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
         accelerometer?.let {
-            // 100 Hz 요청(10,000 µs)
-            sensorManager.registerListener(this, it, 10_000, 0)
+            sensorManager.registerListener(this, it, 10_000, 0) // 100Hz
         }
 
-        // FIR 디시메이터 초기화 (100 -> 50 Hz)
         decimator = FirDecimator3D(HB_TAPS, 2)
 
-        // 스케일러/모델 로드 (assets/scaler.json, assets/model_classification.tflite)
         loadScalerFromAssets("scaler.json")
         initTfliteFromAssets("model_classification.tflite")
 
-        // CSV 로그: 앱 전용 외부 디렉토리(권한 불필요)
+        // CSV 로그
         val dir = getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)!!
         val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.getDefault()).format(Date())
         predictionLogFile = File(dir, "tflite_realtime_${timestamp}.csv")
@@ -167,7 +183,6 @@ class SensorForegroundService : Service(), SensorEventListener {
 
     override fun onDestroy() {
         super.onDestroy()
-        // 브로드캐스트로 "중단됨" 알려서 액티비티가 UI를 고정하도록
         sendBroadcast(Intent("com.example.classification_0623.SERVICE_STATUS").apply {
             putExtra("running", false)
         })
@@ -175,7 +190,6 @@ class SensorForegroundService : Service(), SensorEventListener {
         sensorManager.unregisterListener(this)
         if (::predictionLogWriter.isInitialized) runCatching { predictionLogWriter.close() }
         if (::tflite.isInitialized) runCatching { tflite.close() }
-        // 포그라운드 알림 제거
         stopForeground(true)
 
         Log.d(TAG, "Service destroyed")
@@ -188,11 +202,9 @@ class SensorForegroundService : Service(), SensorEventListener {
 
         val x = event.values[0]; val y = event.values[1]; val z = event.values[2]
 
-        // 100 Hz 입력 → FIR AA → 2:1 디시메이션 → 50 Hz 출력
         val out = decimator.process(x, y, z)
         if (out != null) {
-            buffer.add(out) // out: floatArrayOf(x50, y50, z50)
-
+            buffer.add(out)
             if (buffer.size >= windowSize) {
                 val window = buffer.subList(0, windowSize).toList()
                 processWindow(window)
@@ -207,26 +219,22 @@ class SensorForegroundService : Service(), SensorEventListener {
     private fun pushFixed(q: ArrayDeque<FloatArray>, v: FloatArray, maxLen: Int) {
         q.addLast(v); while (q.size > maxLen) q.removeFirst()
     }
+
     private fun pushFixedInt(q: ArrayDeque<Int>, v: Int, maxLen: Int) {
         q.addLast(v); while (q.size > maxLen) q.removeFirst()
     }
+
     private fun meanOf(q: ArrayDeque<FloatArray>): FloatArray {
         val head = q.firstOrNull() ?: return floatArrayOf()
         val m = FloatArray(head.size)
-        for (a in q) {
-            for (i in a.indices) {
-                m[i] += a[i]
-            }
-        }
+        for (a in q) for (i in a.indices) m[i] += a[i]
         val n = q.size.toFloat()
-        for (i in m.indices) {
-            m[i] /= n
-        }
+        for (i in m.indices) m[i] /= n
         return m
     }
 
     private fun median3(a: Int, b: Int, c: Int): Int {
-        val x = intArrayOf(a,b,c); java.util.Arrays.sort(x); return x[1]
+        val x = intArrayOf(a, b, c); java.util.Arrays.sort(x); return x[1]
     }
 
     private fun processWindow(window: List<FloatArray>) {
@@ -240,28 +248,26 @@ class SensorForegroundService : Service(), SensorEventListener {
         }
         val dsvm = FloatArray(window.size - 1) { i -> abs(svm[i + 1] - svm[i]) }
 
-        val x1 = mean(svm)           // svm_mean
-        val x2 = stdPop(svm)         // svm_std (ddof=0)
-        val x3 = mean(dsvm)          // d_svm_mean
-        val x4 = stdPop(dsvm)        // d_svm_std (ddof=0)
+        val x1 = mean(svm)
+        val x2 = stdPop(svm)
+        val x3 = mean(dsvm)
+        val x4 = stdPop(dsvm)
         val raw4 = floatArrayOf(x1, x2, x3, x4)
 
-        // 2) 표준화(4)  → TFLite 입력은 정규화된 4D
-        val norm4 = FloatArray(4) { i -> (raw4[i] - mu4[i]) / (if (sigma4[i]==0f) 1f else sigma4[i]) }
+        // 2) 표준화(4)
+        val norm4 = FloatArray(4) { i ->
+            (raw4[i] - mu4[i]) / (if (sigma4[i] == 0f) 1f else sigma4[i])
+        }
 
-        // 3) TFLite 추론 (입력 1x4, 출력 1x5)
-        val input = arrayOf(norm4)                // shape: [1,4]
-        val out = Array(1) { FloatArray(numClasses) }  // shape: [1,5]
+        // 3) TFLite 추론
+        val input = arrayOf(norm4)
+        val out = Array(1) { FloatArray(numClasses) }
         tflite.run(input, out)
 
-        // 모델이 확률을 직접 출력한다고 가정
         val p = if (MODEL_OUTPUT_IS_PROBS) out[0] else softmax(out[0])
 
-        // === 공통 계산 ===
         val p1 = p.getOrElse(0){0f}; val p2 = p.getOrElse(1){0f}
         val p3c = p.getOrElse(2){0f}; val p4 = p.getOrElse(3){0f}; val p5 = p.getOrElse(4){0f}
-        val baseArgmax = p.indices.maxByOrNull { p[it] } ?: 0
-        val baseGrade = (baseArgmax + 1).coerceIn(1, 5) // 1..5
 
         // 피처 게이트
         val zStd  = if (sigma4[1] != 0f) (x2 - mu4[1]) / sigma4[1] else 0f
@@ -271,26 +277,26 @@ class SensorForegroundService : Service(), SensorEventListener {
         val isStatic = (x1 < TH_ACTIVITY) && (x3 < TH_D_ACTIVITY)
         val isActiveAny = (x2 >= TH_ACTIVE_STD) || (x4 >= TH_ACTIVE_DSTD)
 
-        // 최근 3창 평균으로 약간 스무딩
+        // 최근 3창 평균 스무딩
         pushFixed(recentP, floatArrayOf(p1,p2,p3c,p4,p5), 3)
         pushFixed(recentX, floatArrayOf(x1,x2,x3,x4), 3)
-        val pMean = meanOf(recentP) // [mp1..mp5]
-        val xMean = meanOf(recentX) // [mx1..mx4]
+        val pMean = meanOf(recentP)
+        val xMean = meanOf(recentX)
         val mp1 = pMean.getOrElse(0){p1}; val mp2 = pMean.getOrElse(1){p2}; val mp3 = pMean.getOrElse(2){p3c}
         val mx1 = xMean.getOrElse(0){x1}; val mx2 = xMean.getOrElse(1){x2}; val mx4 = xMean.getOrElse(3){x4}
 
         val maxLow = max(mp1, mp2)
         val allow3Up   = (mp3 >= TH_P3_UP)   && ((mp3 - maxLow) >= MARGIN_P3_UP)
-        val allow3Down = (mp3 <  TH_P3_DOWN) ||  ((mp3 - maxLow) <  MARGIN_P3_DOWN)
+        val allow3Down = (mp3 <  TH_P3_DOWN) || ((mp3 - maxLow) <  MARGIN_P3_DOWN)
 
-        // jerk guard: 짧은 강한 흔들림이면 2로 유지
+        // jerk guard
         val jerkRatio = mx4 / (mx2 + 1e-6f)
         val isJerkLike = (x4 >= SHAKE_DSTD_HIGH || mx4 >= SHAKE_DSTD_HIGH) &&
                 (x1 <= SHAKE_MEAN_MAX && mx1 <= SHAKE_MEAN_MAX) &&
                 (p3c < P3_STRONG_MIN && mp3 < P3_STRONG_MIN) &&
                 (jerkRatio >= JERK_RATIO_TH)
 
-        // 4·5는 최우선 (확률+마진+게이트)
+        // 4·5 최우선
         var grade: Int? = null
         when {
             allowHigh && (p5 >= TH_P5) && ((p5 - p3c) >= MARGIN_P5) -> grade = 5
@@ -298,23 +304,18 @@ class SensorForegroundService : Service(), SensorEventListener {
         }
 
         if (grade == null) {
-            // 정적은 1
             if (isStatic) {
-                // 중앙값 필터용 후보도 1로 넣어주되, 최종 1은 즉시 확정
                 pushFixedInt(recentGradeCand, 1, 3)
                 grade = 1
             } else {
-                // 중강도 밴드: 계단/빨래 보호
                 val inModerateBand = (x2 in MOD_STD_MIN..(TH_ACTIVE_STD - 1e-6f)) &&
                         (x4 in MOD_DSTD_MIN..(TH_ACTIVE_DSTD - 1e-6f))
 
-                // jerk-like면 강제 2 유지
                 if (isJerkLike) {
                     consec3Cond = 0
                     consec2Cond += 1
                     if (consec2Cond >= HYST_DOWN_CONSEC) state23 = 2
                 } else {
-                    // 히스테리시스: 3으로 올릴 땐 엄격, 2로 내릴 땐 완화 + 중강도 밴드 고려
                     if (allow3Up && isActiveAny) {
                         consec3Cond += 1; consec2Cond = 0
                         if (consec3Cond >= HYST_UP_CONSEC) state23 = 3
@@ -322,15 +323,12 @@ class SensorForegroundService : Service(), SensorEventListener {
                         consec2Cond += 1; consec3Cond = 0
                         if (consec2Cond >= HYST_DOWN_CONSEC) state23 = 2
                     } else {
-                        // 유지
                         consec3Cond = 0; consec2Cond = 0
                     }
                 }
 
-                // 후보 등급 업데이트 (2/3만 다룸)
                 pushFixedInt(recentGradeCand, state23, 3)
 
-                // 3-창 중앙값 필터
                 val gCand = if (recentGradeCand.size == 3) {
                     val a = recentGradeCand.elementAt(0)
                     val b = recentGradeCand.elementAt(1)
@@ -338,10 +336,8 @@ class SensorForegroundService : Service(), SensorEventListener {
                     median3(a,b,c)
                 } else state23
 
-                // 최종: 2/3 영역만 여기서 확정 (안전차원)
                 grade = min(gCand, 3)
 
-                // 추가 보수화: 강한 3 증거가 없고 중강도 밴드면 2로
                 val strong3 = (mp3 >= STRONG_P3) && ((mp3 - maxLow) >= STRONG_MARGIN_P3)
                 if (grade == 3 && inModerateBand && !strong3) {
                     grade = 2
@@ -349,30 +345,39 @@ class SensorForegroundService : Service(), SensorEventListener {
             }
         }
 
+        val finalGrade = grade!!
+
         // === Logcat 출력 ===
         val probsStr = String.format(Locale.US, "%.3f, %.3f, %.3f, %.3f, %.3f", p1, p2, p3c, p4, p5)
-        val featStr = String.format(Locale.US,
-            "svm_mean=%.3f, svm_std=%.3f, d_svm_mean=%.3f, d_svm_std=%.3f", x1, x2, x3, x4)
-        Log.i(TAG, "window=$windowCounter, grade=$grade, p=[$probsStr], feat=[$featStr]")
+        val featStr = String.format(
+            Locale.US,
+            "svm_mean=%.3f, svm_std=%.3f, d_svm_mean=%.3f, d_svm_std=%.3f",
+            x1, x2, x3, x4
+        )
+        Log.i(TAG, "window=$windowCounter, grade=$finalGrade, p=[$probsStr], feat=[$featStr]")
 
-        // 4) CSV 로그
+        // ===================== (추가) 서버 전송 트리거 =====================
+        maybeSendImuAlert(finalGrade)
+        // ================================================================
+
+        // 4) CSV 로그 (기존 유지)
         val ts = nowTimestampMicros()
         predictionLogWriter.apply {
-            write("$ts,$windowCounter,$grade,")
+            write("$ts,$windowCounter,$finalGrade,")
             for (i in 0 until 5) write(String.format(Locale.US, "%.6f,", p.getOrElse(i){0f}))
             write(String.format(Locale.US, "%.6f,%.6f,%.6f,%.6f\n", x1, x2, x3, x4))
             flush()
         }
 
-        // 5) 브로드캐스트 (0..4로 전송 → 액티비티에서 +1)
+        // 5) 브로드캐스트
         sendBroadcast(Intent("com.example.classification_0623.PREDICTION_RESULT").apply {
             setPackage(packageName)
-            putExtra("prediction", grade!! - 1)
+            putExtra("prediction", finalGrade - 1) // 0..4
             putExtra("windowIndex", windowCounter)
         })
 
         // 6) 경고 진동 (5일 때)
-        if (grade == 5) {
+        if (finalGrade == 5) {
             val vibrator = getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 vibrator.vibrate(VibrationEffect.createOneShot(1000, VibrationEffect.DEFAULT_AMPLITUDE))
@@ -381,6 +386,78 @@ class SensorForegroundService : Service(), SensorEventListener {
             }
         }
     }
+
+    // ======== 서버 전송 관련 함수들 ========
+
+    /** grade가 4/5일 때만 서버로 전송 (중복 전송 방지 포함) */
+    private fun maybeSendImuAlert(grade: Int) {
+        if (grade < 4) {
+            // 위험 레벨이 내려가면 상태 리셋해서 다음에 4로 올라갈 때 다시 전송되게
+            if (lastSentLevel >= 4) lastSentLevel = grade
+            return
+        }
+        val nowMs = System.currentTimeMillis()
+        // 3->4 또는 4->5 상승 이벤트면 전송
+        val isEdgeUp = (lastSentLevel < 4) || (grade > lastSentLevel)
+        // 또는 쿨다운 지나면 재전송(원하면)
+        val cooldownPassed = (SEND_COOLDOWN_MS <= 0L) || ((nowMs - lastSentAtMs) >= SEND_COOLDOWN_MS)
+
+        if (isEdgeUp || cooldownPassed) {
+            val isoTs = isoUtcNow()
+            sendImuAlertToServer(protecteeId, isoTs, grade)
+            lastSentLevel = grade
+            lastSentAtMs = nowMs
+        }
+    }
+
+    /** POST 호출 */
+    private fun sendImuAlertToServer(protecteeId: String, timestampIso: String, level: Int) {
+        val url = BASE_URL + IMU_ALERT_PATH
+        val jsonObj = JSONObject().apply {
+            put("protectee_id", protecteeId)   // 또는 put("protectee_id", protecteeId.toInt())
+            put("timestamp", timestampIso)
+            put("imu_danger_level", level)
+        }
+        val json = jsonObj.toString()
+
+        Log.i(TAG, "IMU POST -> $url")
+        Log.i(TAG, "IMU POST body -> $json")
+
+        val body = json.toRequestBody("application/json; charset=utf-8".toMediaType())
+        val req = Request.Builder()
+            .url(url)
+            .addHeader("Accept", "application/json")
+            .post(body)
+            .build()
+
+        httpClient.newCall(req).enqueue(object : Callback {
+            override fun onFailure(call: Call, e: IOException) {
+                Log.e(TAG, "IMU alert POST failed: ${e.message}", e)
+            }
+            override fun onResponse(call: Call, response: Response) {
+                response.use { res ->
+                    val respBody = res.body?.string()
+                    Log.e(TAG, "IMU alert response code=${res.code} msg=${res.message} body=$respBody")
+                }
+            }
+        })
+    }
+
+    /** 서버 전송용 ISO 8601 (UTC Z) */
+    private fun isoUtcNow(): String {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            java.time.OffsetDateTime.now(java.time.ZoneOffset.UTC)
+                .truncatedTo(java.time.temporal.ChronoUnit.MILLIS)
+                .format(java.time.format.DateTimeFormatter.ISO_OFFSET_DATE_TIME)
+            // 예: 2025-08-11T00:42:42.061+00:00
+        } else {
+            SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSSXXX", Locale.US).apply {
+                timeZone = TimeZone.getTimeZone("UTC")
+            }.format(Date())
+        }
+    }
+
+    // =====================================
 
     private fun createNotification() {
         val channelId = "sensor_channel"
@@ -400,7 +477,6 @@ class SensorForegroundService : Service(), SensorEventListener {
     private fun loadScalerFromAssets(fileName: String) {
         val text = assets.open(fileName).bufferedReader().use { it.readText() }
         val obj = JSONObject(text)
-        // mean_/scale_ 또는 mean/scale를 모두 지원
         fun getArr(vararg keys: String): FloatArray {
             for (k in keys) if (obj.has(k)) return jaToFloatArray(obj.getJSONArray(k))
             throw RuntimeException("Missing keys: ${keys.joinToString()}")
@@ -415,15 +491,15 @@ class SensorForegroundService : Service(), SensorEventListener {
         return out
     }
 
-    // ==== TFLite 로더 ==== (압축 여부 무관하게 동작)
+    // ==== TFLite 로더 ====
     private fun initTfliteFromAssets(modelName: String) {
         val mbb = try {
-            val fd = assets.openFd(modelName) // 무압축일 때만 성공
+            val fd = assets.openFd(modelName)
             FileInputStream(fd.fileDescriptor).use { fis ->
                 fis.channel.map(FileChannel.MapMode.READ_ONLY, fd.startOffset, fd.declaredLength)
             }
         } catch (_: Exception) {
-            val bytes = assets.open(modelName).use { it.readBytes() } // 압축되어 있을 때
+            val bytes = assets.open(modelName).use { it.readBytes() }
             java.nio.ByteBuffer.allocateDirect(bytes.size).apply {
                 order(java.nio.ByteOrder.nativeOrder())
                 put(bytes)
@@ -450,11 +526,13 @@ class SensorForegroundService : Service(), SensorEventListener {
         for (i in logits.indices) exps[i] /= if (sum == 0f) 1f else sum
         return exps
     }
+
     private fun mean(a: FloatArray): Float {
         var s = 0.0
         for (v in a) s += v
         return (s / a.size).toFloat()
     }
+
     private fun stdPop(a: FloatArray): Float {
         if (a.isEmpty()) return 0f
         val m = mean(a)
@@ -465,6 +543,8 @@ class SensorForegroundService : Service(), SensorEventListener {
         }
         return sqrt((acc / a.size).toFloat())
     }
+
+    /** CSV 로그용(기존 유지): ISO가 아님 */
     private fun nowTimestampMicros(): String {
         val us = baseWallMs * 1000L + (System.nanoTime() - baseNano) / 1000L
         val ms = us / 1000L
@@ -476,8 +556,8 @@ class SensorForegroundService : Service(), SensorEventListener {
 
 /** 선형 위상 FIR를 이용해 3축을 동시에 2:1 디시메이션하는 간단 클래스 */
 private class FirDecimator3D(
-    private val h: FloatArray,         // FIR taps (h[0..L-1])
-    private val M: Int                  // decimation factor (여기선 2)
+    private val h: FloatArray,
+    private val M: Int
 ) {
     private val L = h.size
     private val xb = FloatArray(L)
@@ -486,7 +566,6 @@ private class FirDecimator3D(
     private var idx = 0
     private var inCount = 0
 
-    /** 100 Hz 입력 하나를 넣고, 디시메이션 타이밍이면 50 Hz 출력(x,y,z)을 반환. 아니면 null */
     fun process(x: Float, y: Float, z: Float): FloatArray? {
         xb[idx] = x; yb[idx] = y; zb[idx] = z
         idx = (idx + 1) % L
