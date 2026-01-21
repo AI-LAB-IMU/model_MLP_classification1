@@ -9,6 +9,7 @@ import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
+import android.provider.Settings
 import android.util.Log
 import android.view.WindowManager
 import android.widget.Button
@@ -16,6 +17,7 @@ import android.widget.TextView
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
+import java.util.UUID
 
 class MainActivity : AppCompatActivity() {
 
@@ -49,6 +51,18 @@ class MainActivity : AppCompatActivity() {
         ActivityResultContracts.RequestPermission()
     ) { /* 필요 시 결과 처리 */ }
 
+    // device_id 생성/저장 (워치 고유값)
+    private fun getOrCreateDeviceId(): String {
+        val prefs = getSharedPreferences("app_prefs", MODE_PRIVATE)
+        prefs.getString("device_id", null)?.let { return it }
+
+        val androidId = Settings.Secure.getString(contentResolver, Settings.Secure.ANDROID_ID)
+        val deviceId = androidId ?: UUID.randomUUID().toString()
+
+        prefs.edit().putString("device_id", deviceId).apply()
+        return deviceId
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
@@ -79,9 +93,15 @@ class MainActivity : AppCompatActivity() {
 
         findViewById<Button>(R.id.startButton).setOnClickListener {
             allowPredictionUpdates = true
-            val intent = Intent(this, SensorForegroundService::class.java)
+
+            // device_id를 서비스로 전달
+            val deviceId = getOrCreateDeviceId()
+            val intent = Intent(this, SensorForegroundService::class.java).apply {
+                putExtra("device_id", deviceId)
+            }
+
             ContextCompat.startForegroundService(this, intent)
-            Log.d("MainActivity", "ForegroundService 시작")
+            Log.d("MainActivity", "ForegroundService 시작 device_id=$deviceId")
             resultTextView.text = "측정중"
         }
 

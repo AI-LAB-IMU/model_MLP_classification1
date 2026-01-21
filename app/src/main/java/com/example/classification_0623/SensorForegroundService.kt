@@ -16,6 +16,7 @@ import android.os.Environment
 import android.os.IBinder
 import android.os.VibrationEffect
 import android.os.Vibrator
+import android.provider.Settings
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import okhttp3.Call
@@ -31,6 +32,7 @@ import org.tensorflow.lite.Interpreter
 import java.io.BufferedWriter
 import java.io.File
 import java.io.FileInputStream
+import java.io.BufferedReader
 import java.io.FileWriter
 import java.io.IOException
 import java.nio.channels.FileChannel
@@ -38,6 +40,7 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
+import java.util.UUID
 import kotlin.math.abs
 import kotlin.math.exp
 import kotlin.math.max
@@ -138,7 +141,9 @@ class SensorForegroundService : Service(), SensorEventListener {
     // ===================== 서버 연동 설정 =====================
     private val BASE_URL = "http://210.125.91.90:8000"
     private val IMU_ALERT_PATH = "/api/v1/events/imu-alert"
-    private val protecteeId = "1" // 현재 Django admin에 등록된 Protectee ID
+
+    // device_id 사용
+    private var deviceId: String = "unknown"
 
     private val httpClient: OkHttpClient = OkHttpClient()
 
@@ -147,12 +152,36 @@ class SensorForegroundService : Service(), SensorEventListener {
     private val SEND_COOLDOWN_MS = 0L
     // =========================================================
 
+    // Service에서도 device_id 생성/저장(서비스 재시작 대비)
+    private fun getOrCreateDeviceIdInService(): String {
+        val prefs = getSharedPreferences("app_prefs", MODE_PRIVATE)
+        prefs.getString("device_id", null)?.let { return it }
+
+        val androidId = Settings.Secure.getString(contentResolver, Settings.Secure.ANDROID_ID)
+        val id = androidId ?: UUID.randomUUID().toString()
+
+        prefs.edit().putString("device_id", id).apply()
+        return id
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        // MainActivity에서 device_id가 넘어오면 우선 사용, 아니면 로컬 저장값 생성/사용
+        deviceId = intent?.getStringExtra("device_id") ?: getOrCreateDeviceIdInService()
+        Log.i(TAG, "Service onStartCommand device_id=$deviceId")
+        return START_STICKY
+    }
+
     override fun onCreate() {
         super.onCreate()
         createNotification()
 
         baseWallMs = System.currentTimeMillis()
         baseNano = System.nanoTime()
+
+        // onStartCommand 전에 센서 이벤트가 들어와도 대비(초기값 확보)
+        if (deviceId == "unknown") {
+            deviceId = getOrCreateDeviceIdInService()
+        }
 
         // 센서 매니저/가속도계
         sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
@@ -178,7 +207,7 @@ class SensorForegroundService : Service(), SensorEventListener {
         )
         predictionLogWriter.flush()
 
-        Log.d(TAG, "Service created")
+        Log.d(TAG, "Service created device_id=$deviceId")
     }
 
     override fun onDestroy() {
@@ -356,7 +385,7 @@ class SensorForegroundService : Service(), SensorEventListener {
         )
         Log.i(TAG, "window=$windowCounter, grade=$finalGrade, p=[$probsStr], feat=[$featStr]")
 
-        // ===================== (추가) 서버 전송 트리거 =====================
+        // ===================== 서버 전송 트리거 =====================
         maybeSendImuAlert(finalGrade)
         // ================================================================
 
@@ -404,17 +433,18 @@ class SensorForegroundService : Service(), SensorEventListener {
 
         if (isEdgeUp || cooldownPassed) {
             val isoTs = isoUtcNow()
-            sendImuAlertToServer(protecteeId, isoTs, grade)
+            // device_id 전송
+            sendImuAlertToServer(deviceId, isoTs, grade)
             lastSentLevel = grade
             lastSentAtMs = nowMs
         }
     }
 
     /** POST 호출 */
-    private fun sendImuAlertToServer(protecteeId: String, timestampIso: String, level: Int) {
+    private fun sendImuAlertToServer(deviceId: String, timestampIso: String, level: Int) {
         val url = BASE_URL + IMU_ALERT_PATH
         val jsonObj = JSONObject().apply {
-            put("protectee_id", protecteeId)   // 또는 put("protectee_id", protecteeId.toInt())
+            put("device_id", deviceId)
             put("timestamp", timestampIso)
             put("imu_danger_level", level)
         }
@@ -523,7 +553,7 @@ class SensorForegroundService : Service(), SensorEventListener {
             val e = exp((logits[i] - m).toDouble()).toFloat()
             exps[i] = e; sum += e
         }
-        for (i in logits.indices) exps[i] /= if (sum == 0f) 1f else sum
+        for (i in exps.indices) exps[i] /= if (sum == 0f) 1f else sum
         return exps
     }
 
