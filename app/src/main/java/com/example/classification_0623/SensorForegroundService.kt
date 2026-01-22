@@ -1,12 +1,15 @@
 // ==================== SensorForegroundService.kt ====================
 package com.example.classification_0623
 
+import android.Manifest
+import com.example.classification_0623.geo.GeoReporter
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
@@ -19,6 +22,7 @@ import android.os.Vibrator
 import android.provider.Settings
 import android.util.Log
 import androidx.core.app.NotificationCompat
+import androidx.core.content.ContextCompat
 import okhttp3.Call
 import okhttp3.Callback
 import okhttp3.MediaType.Companion.toMediaType
@@ -141,6 +145,11 @@ class SensorForegroundService : Service(), SensorEventListener {
     // ===================== 서버 연동 설정 =====================
     private val BASE_URL = "http://210.125.91.90:8000"
     private val IMU_ALERT_PATH = "/api/v1/events/imu-alert"
+    private val GEO_ALERT_PATH = "/api/v1/events/geo-alert"
+    private val GEO_INTERVAL_MS = 5 * 60 * 1000L
+
+    private var geoReporter: GeoReporter? = null
+    private var geoStarted = false
 
     // device_id 사용
     private var deviceId: String = "unknown"
@@ -150,24 +159,70 @@ class SensorForegroundService : Service(), SensorEventListener {
     private var lastSentLevel = 0
     private var lastSentAtMs = 0L
     private val SEND_COOLDOWN_MS = 0L
-    // =========================================================
+
+    //device_id 정규화
+    private fun normalizedModel(): String {
+        val m = (Build.MODEL ?: Build.DEVICE ?: "unknown").trim()
+        return m.replace("\\s+".toRegex(), "").replace("/", "_")
+    }
+    private fun ensurePrefixed(id: String): String {
+        // 이미 prefix 있으면 그대로
+        if (id.contains("_")) return id
+        return "${normalizedModel()}_${id}"
+    }
 
     // Service에서도 device_id 생성/저장(서비스 재시작 대비)
     private fun getOrCreateDeviceIdInService(): String {
         val prefs = getSharedPreferences("app_prefs", MODE_PRIVATE)
-        prefs.getString("device_id", null)?.let { return it }
-
+        val saved = prefs.getString("device_id", null)
+        if (!saved.isNullOrBlank()) {
+            val fixed = ensurePrefixed(saved)
+            if (fixed != saved) {
+                prefs.edit().putString("device_id", fixed).apply()
+            }
+            return fixed
+        }
         val androidId = Settings.Secure.getString(contentResolver, Settings.Secure.ANDROID_ID)
-        val id = androidId ?: UUID.randomUUID().toString()
+        val base = androidId?.takeIf { it.isNotBlank() } ?: UUID.randomUUID().toString()
 
+        val id = ensurePrefixed(base)
         prefs.edit().putString("device_id", id).apply()
         return id
     }
 
+    // 위치 정보 돌고 있는지 디버그
+    private fun hasLocationPerm(): Boolean {
+        val fine = ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
+        val coarse = ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
+        return fine || coarse
+    }
+    private fun isLocationEnabled(): Boolean {
+        val lm = getSystemService(Context.LOCATION_SERVICE) as android.location.LocationManager
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            lm.isLocationEnabled
+        } else {
+            @Suppress("DEPRECATION")
+            lm.isProviderEnabled(android.location.LocationManager.GPS_PROVIDER) ||
+                    lm.isProviderEnabled(android.location.LocationManager.NETWORK_PROVIDER)
+        }
+    }
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        // MainActivity에서 device_id가 넘어오면 우선 사용, 아니면 로컬 저장값 생성/사용
-        deviceId = intent?.getStringExtra("device_id") ?: getOrCreateDeviceIdInService()
-        Log.i(TAG, "Service onStartCommand device_id=$deviceId")
+        // ✅ 변경: intent로 들어와도 무조건 prefix 보정 + prefs에 저장
+        val raw = intent?.getStringExtra("device_id") ?: getOrCreateDeviceIdInService()
+        deviceId = ensurePrefixed(raw)
+
+        getSharedPreferences("app_prefs", MODE_PRIVATE)
+            .edit().putString("device_id", deviceId).apply()
+        Log.i(TAG, "Service onStartCommand raw=$raw -> device_id=$deviceId")
+        Log.i(TAG, "GEO debug: geoReporterNull=${geoReporter==null}, geoStarted=$geoStarted, perm=${hasLocationPerm()}, locEnabled=${isLocationEnabled()}")
+
+        // GEO 시작
+        if (!geoStarted && geoReporter != null) {
+            geoReporter!!.start()
+            geoStarted = true
+            Log.i(TAG, "GeoReporter started")
+        }
         return START_STICKY
     }
 
@@ -182,6 +237,17 @@ class SensorForegroundService : Service(), SensorEventListener {
         if (deviceId == "unknown") {
             deviceId = getOrCreateDeviceIdInService()
         }
+
+        // GEO (5분 위치 수집 + 서버 POST)
+        geoReporter = GeoReporter(
+            context = this,
+            httpClient = httpClient,
+            baseUrl = BASE_URL,
+            path = GEO_ALERT_PATH,
+            intervalMs = GEO_INTERVAL_MS,        // 5분
+            deviceIdProvider = { deviceId },
+            timestampProvider = { isoUtcNow() }
+        )
 
         // 센서 매니저/가속도계
         sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
@@ -212,6 +278,12 @@ class SensorForegroundService : Service(), SensorEventListener {
 
     override fun onDestroy() {
         super.onDestroy()
+
+        // GEO 종료
+        runCatching { geoReporter?.stop() }
+        geoReporter = null
+        geoStarted = false
+
         sendBroadcast(Intent("com.example.classification_0623.SERVICE_STATUS").apply {
             putExtra("running", false)
         })
@@ -433,8 +505,7 @@ class SensorForegroundService : Service(), SensorEventListener {
 
         if (isEdgeUp || cooldownPassed) {
             val isoTs = isoUtcNow()
-            // device_id 전송
-            sendImuAlertToServer(deviceId, isoTs, grade)
+            sendImuAlertToServer(ensurePrefixed(deviceId), isoTs, grade)
             lastSentLevel = grade
             lastSentAtMs = nowMs
         }
