@@ -21,4 +21,3 @@ dependencyResolutionManagement {
 
 rootProject.name = "classification_0623"
 include(":app")
- 
