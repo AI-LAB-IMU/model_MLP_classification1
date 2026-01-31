@@ -50,6 +50,10 @@ dependencies {
     implementation(files("libs/samsung-health-tracking-1.4.1.aar"))
     implementation("com.google.android.gms:play-services-location:21.3.0")
 
+    implementation("com.squareup.retrofit2:retrofit:2.11.0")
+    implementation("com.squareup.retrofit2:converter-gson:2.11.0")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
+
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.appcompat)
     implementation(libs.material)

@@ -10,10 +10,15 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.INTERNET" />
 
+    <uses-permission android:name="android.permission.BODY_SENSORS" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_HEALTH" />
+    <uses-permission android:name="com.samsung.android.health.tracking.permission.HEALTH_TRACKING" />
+
     <!-- 위치 권한 -->
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
+
 
     <application
         android:usesCleartextTraffic="true"
@@ -32,6 +37,11 @@
             android:enabled="true"
             android:exported="false"
             android:foregroundServiceType="dataSync|location" />
+
+        <service
+            android:name=".ppg.PPGService"
+            android:exported="false"
+            android:foregroundServiceType="health|dataSync" />
 
         <activity
             android:name=".MainActivity"
