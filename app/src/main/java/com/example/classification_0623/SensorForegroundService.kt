@@ -17,8 +17,6 @@ import android.hardware.SensorManager
 import android.os.Build
 import android.os.Environment
 import android.os.IBinder
-import android.os.VibrationEffect
-import android.os.Vibrator
 import android.provider.Settings
 import android.util.Log
 import androidx.core.app.NotificationCompat
@@ -32,100 +30,38 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import org.json.JSONArray
 import org.json.JSONObject
-import org.tensorflow.lite.Interpreter
 import java.io.BufferedWriter
 import java.io.File
-import java.io.FileInputStream
-import java.io.BufferedReader
 import java.io.FileWriter
 import java.io.IOException
-import java.nio.channels.FileChannel
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
 import java.util.UUID
-import kotlin.math.abs
-import kotlin.math.exp
-import kotlin.math.max
-import kotlin.math.min
-import kotlin.math.sqrt
-import kotlin.collections.ArrayDeque
 
 class SensorForegroundService : Service(), SensorEventListener {
 
-    private val TAG = "RealtimePredict"
+    private val TAG = "IMURawUpload"
 
     private lateinit var sensorManager: SensorManager
     private var accelerometer: Sensor? = null
 
-    // 50 Hz 윈도우(6s/3s)
+    // 윈도우/슬라이드 설정
+    // 100Hz → FIR 디시메이션 → 50Hz
+    // windowSize = 300샘플 = 6초 @ 50Hz
+    // slideSize  = 150샘플 = 3초 @ 50Hz  (50% overlap, 3초마다 전송)
     private val windowSize = 300
     private val slideSize  = 150
-    private val buffer = mutableListOf<FloatArray>()   // FIR+디시메이션 후 50 Hz 샘플(x,y,z)
+
+    // FIR 디시메이션 후 50Hz 샘플 버퍼 (x, y, z)
+    private val buffer          = mutableListOf<FloatArray>()
+    // 각 50Hz 샘플의 타임스탬프 버퍼 (start/end 추출용)
+    private val timestampBuffer = mutableListOf<String>()
 
     private var windowCounter = 0
 
-    // CSV 로그
-    private lateinit var predictionLogFile: File
-    private lateinit var predictionLogWriter: BufferedWriter
-
-    // === TFLite 모델 (assets/model_classification.tflite) ===
-    private lateinit var tflite: Interpreter
-    private val numClasses = 5
-    // 모델 출력이 확률(softmax 내장)이라고 가정
-    private val MODEL_OUTPUT_IS_PROBS = true
-
-    // 스케일러(원특징 기준 4개 평균/표준편차)
-    private lateinit var mu4: FloatArray           // length 4
-    private lateinit var sigma4: FloatArray        // length 4
-
-    // === 보수화 파라미터(기존) ===
-    private val TH_P5 = 0.90f
-    private val TH_P4 = 0.65f
-    private val MARGIN_P5 = 0.30f
-    private val MARGIN_P4 = 0.15f
-    private val GATE_Z_STD   = 0.75f
-    private val GATE_Z_DSTD  = 0.85f
-    private val TH_P3 = 0.50f
-    private val MARGIN_P3 = 0.08f
-    private val TH_ACTIVITY = 9.85f
-    private val TH_D_ACTIVITY = 0.15f
-    private val TH_ACTIVE_STD = 1.0f
-    private val TH_ACTIVE_DSTD = 1.2f
-
-    // --- 2↔3 보수화(중강도 밴드) ---
-    private val STRONG_P3 = 0.60f
-    private val STRONG_MARGIN_P3 = 0.12f
-    private val MOD_STD_MIN = 0.30f
-    private val MOD_DSTD_MIN = 0.30f
-
-    // --- 2↔3 히스테리시스 & 스파이크(“털기/지우기”) 가드 & 간단 스무딩 ---
-    private val HYST_UP_CONSEC = 1
-    private val HYST_DOWN_CONSEC = 1
-    private val TH_P3_UP = 0.50f
-    private val TH_P3_DOWN = 0.45f
-    private val MARGIN_P3_UP = 0.08f
-    private val MARGIN_P3_DOWN = 0.05f
-
-    private val SHAKE_DSTD_HIGH = 1.80f
-    private val SHAKE_MEAN_MAX = TH_ACTIVITY + 0.8f
-    private val P3_STRONG_MIN = 0.60f
-    private val JERK_RATIO_TH = 1.50f
-
-    private val recentP = ArrayDeque<FloatArray>()   // 최근 3창 [p1..p5]
-    private val recentX = ArrayDeque<FloatArray>()   // 최근 3창 [x1..x4]
-    private val recentGradeCand = ArrayDeque<Int>()  // 최근 3창 grade 후보(2/3용)
-    private var consec3Cond = 0
-    private var consec2Cond = 0
-    private var state23 = 2  // 2/3 상태 기억 (초기 2)
-
-    // === 타임스탬프(마이크로초 표기용: CSV용) ===
-    private var baseWallMs: Long = 0L
-    private var baseNano: Long = 0L
-    private val sdfMillis = SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.getDefault())
-
-    // === 100→50 Hz AA FIR + 2:1 디시메이터 ===
+    // 100→50 Hz AA FIR + 2:1 디시메이터
     private val HB_TAPS = floatArrayOf(
         0.00010228f, -0.00012024f, -0.00024596f, 0.00011137f, 0.00045327f, -0.00000000f, -0.00069560f, -0.00026395f,
         0.00091269f, 0.00071509f, -0.00101310f, -0.00135490f, 0.00088289f, 0.00213500f, -0.00040322f, -0.00294544f,
@@ -143,59 +79,62 @@ class SensorForegroundService : Service(), SensorEventListener {
     private lateinit var decimator: FirDecimator3D
 
     // ===================== 서버 연동 설정 =====================
-    private val BASE_URL = "http://210.125.91.90:8000"
-    private val IMU_ALERT_PATH = "/api/v1/events/imu-alert"
-    private val GEO_ALERT_PATH = "/api/v1/events/geo-alert"
+    private val BASE_URL        = "http://210.125.91.90:8000"
+    private val IMU_RAW_PATH    = "/api/v1/events/imu-raw"
+    private val GEO_ALERT_PATH  = "/api/v1/events/geo-alert"
     private val GEO_INTERVAL_MS = 5 * 60 * 1000L
 
     private var geoReporter: GeoReporter? = null
     private var geoStarted = false
 
-    // device_id 사용
     private var deviceId: String = "unknown"
 
     private val httpClient: OkHttpClient = OkHttpClient()
 
-    private var lastSentLevel = 0
-    private var lastSentAtMs = 0L
-    private val SEND_COOLDOWN_MS = 0L
+    // 타임스탬프
+    private var baseWallMs: Long = 0L
+    private var baseNano:   Long = 0L
+    private val sdfMillis = SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.getDefault())
 
-    //device_id 정규화
+    // CSV 로그
+    private lateinit var rawLogFile:   File
+    private lateinit var rawLogWriter: BufferedWriter
+
+
+    // device_id 유틸
     private fun normalizedModel(): String {
         val m = (Build.MODEL ?: Build.DEVICE ?: "unknown").trim()
         return m.replace("\\s+".toRegex(), "").replace("/", "_")
     }
+
     private fun ensurePrefixed(id: String): String {
-        // 이미 prefix 있으면 그대로
         if (id.contains("_")) return id
         return "${normalizedModel()}_${id}"
     }
 
-    // Service에서도 device_id 생성/저장(서비스 재시작 대비)
     private fun getOrCreateDeviceIdInService(): String {
         val prefs = getSharedPreferences("app_prefs", MODE_PRIVATE)
         val saved = prefs.getString("device_id", null)
         if (!saved.isNullOrBlank()) {
             val fixed = ensurePrefixed(saved)
-            if (fixed != saved) {
-                prefs.edit().putString("device_id", fixed).apply()
-            }
+            if (fixed != saved) prefs.edit().putString("device_id", fixed).apply()
             return fixed
         }
         val androidId = Settings.Secure.getString(contentResolver, Settings.Secure.ANDROID_ID)
         val base = androidId?.takeIf { it.isNotBlank() } ?: UUID.randomUUID().toString()
-
         val id = ensurePrefixed(base)
         prefs.edit().putString("device_id", id).apply()
         return id
     }
 
-    // 위치 정보 돌고 있는지 디버그
+
+    // 위치/GPS 디버그 유틸
     private fun hasLocationPerm(): Boolean {
-        val fine = ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
+        val fine   = ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION)   == PackageManager.PERMISSION_GRANTED
         val coarse = ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
         return fine || coarse
     }
+
     private fun isLocationEnabled(): Boolean {
         val lm = getSystemService(Context.LOCATION_SERVICE) as android.location.LocationManager
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
@@ -207,17 +146,57 @@ class SensorForegroundService : Service(), SensorEventListener {
         }
     }
 
+
+    override fun onCreate() {
+        super.onCreate()
+        createNotification()
+
+        baseWallMs = System.currentTimeMillis()
+        baseNano   = System.nanoTime()
+
+        if (deviceId == "unknown") deviceId = getOrCreateDeviceIdInService()
+
+        // GEO
+        geoReporter = GeoReporter(
+            context           = this,
+            httpClient        = httpClient,
+            baseUrl           = BASE_URL,
+            path              = GEO_ALERT_PATH,
+            intervalMs        = GEO_INTERVAL_MS,
+            deviceIdProvider  = { deviceId },
+            timestampProvider = { isoUtcNow() }
+        )
+
+        // 센서 (100Hz)
+        sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
+        accelerometer = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
+        accelerometer?.let {
+            sensorManager.registerListener(this, it, 10_000, 0)
+        }
+
+        // FIR 디시메이터 초기화
+        decimator = FirDecimator3D(HB_TAPS, 2)
+
+        // CSV 로그
+        val dir = getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)!!
+        val ts  = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.getDefault()).format(Date())
+        rawLogFile   = File(dir, "imu_raw_${ts}.csv")
+        rawLogWriter = BufferedWriter(FileWriter(rawLogFile, true))
+        rawLogWriter.write("timestamp,x,y,z\n")
+        rawLogWriter.flush()
+
+        Log.d(TAG, "Service created device_id=$deviceId")
+    }
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        // ✅ 변경: intent로 들어와도 무조건 prefix 보정 + prefs에 저장
         val raw = intent?.getStringExtra("device_id") ?: getOrCreateDeviceIdInService()
         deviceId = ensurePrefixed(raw)
-
         getSharedPreferences("app_prefs", MODE_PRIVATE)
             .edit().putString("device_id", deviceId).apply()
-        Log.i(TAG, "Service onStartCommand raw=$raw -> device_id=$deviceId")
-        Log.i(TAG, "GEO debug: geoReporterNull=${geoReporter==null}, geoStarted=$geoStarted, perm=${hasLocationPerm()}, locEnabled=${isLocationEnabled()}")
 
-        // GEO 시작
+        Log.i(TAG, "onStartCommand device_id=$deviceId")
+        Log.i(TAG, "GEO debug: geoReporterNull=${geoReporter == null}, geoStarted=$geoStarted, perm=${hasLocationPerm()}, locEnabled=${isLocationEnabled()}")
+
         if (!geoStarted && geoReporter != null) {
             geoReporter!!.start()
             geoStarted = true
@@ -226,71 +205,19 @@ class SensorForegroundService : Service(), SensorEventListener {
         return START_STICKY
     }
 
-    override fun onCreate() {
-        super.onCreate()
-        createNotification()
-
-        baseWallMs = System.currentTimeMillis()
-        baseNano = System.nanoTime()
-
-        // onStartCommand 전에 센서 이벤트가 들어와도 대비(초기값 확보)
-        if (deviceId == "unknown") {
-            deviceId = getOrCreateDeviceIdInService()
-        }
-
-        // GEO (5분 위치 수집 + 서버 POST)
-        geoReporter = GeoReporter(
-            context = this,
-            httpClient = httpClient,
-            baseUrl = BASE_URL,
-            path = GEO_ALERT_PATH,
-            intervalMs = GEO_INTERVAL_MS,        // 5분
-            deviceIdProvider = { deviceId },
-            timestampProvider = { isoUtcNow() }
-        )
-
-        // 센서 매니저/가속도계
-        sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
-        accelerometer = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
-        accelerometer?.let {
-            sensorManager.registerListener(this, it, 10_000, 0) // 100Hz
-        }
-
-        decimator = FirDecimator3D(HB_TAPS, 2)
-
-        loadScalerFromAssets("scaler.json")
-        initTfliteFromAssets("model_classification.tflite")
-
-        // CSV 로그
-        val dir = getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)!!
-        val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.getDefault()).format(Date())
-        predictionLogFile = File(dir, "tflite_realtime_${timestamp}.csv")
-        predictionLogWriter = BufferedWriter(FileWriter(predictionLogFile, true))
-        predictionLogWriter.write(
-            "timestamp,window,grade," +
-                    "p1,p2,p3,p4,p5," +
-                    "svm_mean,svm_std,d_svm_mean,d_svm_std\n"
-        )
-        predictionLogWriter.flush()
-
-        Log.d(TAG, "Service created device_id=$deviceId")
-    }
-
     override fun onDestroy() {
         super.onDestroy()
 
-        // GEO 종료
         runCatching { geoReporter?.stop() }
         geoReporter = null
-        geoStarted = false
+        geoStarted  = false
 
         sendBroadcast(Intent("com.example.classification_0623.SERVICE_STATUS").apply {
             putExtra("running", false)
         })
 
         sensorManager.unregisterListener(this)
-        if (::predictionLogWriter.isInitialized) runCatching { predictionLogWriter.close() }
-        if (::tflite.isInitialized) runCatching { tflite.close() }
+        if (::rawLogWriter.isInitialized) runCatching { rawLogWriter.close() }
         stopForeground(true)
 
         Log.d(TAG, "Service destroyed")
@@ -298,259 +225,107 @@ class SensorForegroundService : Service(), SensorEventListener {
 
     override fun onBind(intent: Intent?): IBinder? = null
 
+
+    // imu 센서 이벤트
     override fun onSensorChanged(event: SensorEvent?) {
         if (event?.sensor?.type != Sensor.TYPE_ACCELEROMETER) return
 
-        val x = event.values[0]; val y = event.values[1]; val z = event.values[2]
+        val x = event.values[0]
+        val y = event.values[1]
+        val z = event.values[2]
 
-        val out = decimator.process(x, y, z)
-        if (out != null) {
-            buffer.add(out)
-            if (buffer.size >= windowSize) {
-                val window = buffer.subList(0, windowSize).toList()
-                processWindow(window)
-                buffer.subList(0, slideSize).clear()
-            }
+        // 100Hz → FIR AA 필터 → 50Hz 디시메이션
+        val out = decimator.process(x, y, z) ?: return
+
+        val ts = isoUtcNow()
+
+        // CSV 로컬 기록 (50Hz 기준)
+        rawLogWriter.write("$ts,${out[0]},${out[1]},${out[2]}\n")
+        rawLogWriter.flush()
+
+        // 50Hz 버퍼에 누적
+        buffer.add(out)
+        timestampBuffer.add(ts)
+
+        // 300샘플(6초) 도달 시 윈도우 전송
+        if (buffer.size >= windowSize) {
+            windowCounter++
+
+            val windowSamples = buffer.subList(0, windowSize).toList()
+            val startTs = timestampBuffer.first()               // 윈도우 첫 샘플 시각
+            val endTs   = timestampBuffer[windowSize - 1]       // 윈도우 마지막 샘플 시각
+
+            sendWindowToServer(windowSamples, startTs, endTs)
+
+            // 150샘플(3초) 슬라이드
+            buffer.subList(0, slideSize).clear()
+            timestampBuffer.subList(0, slideSize).clear()
+
+            Log.d(TAG, "window=$windowCounter sent | samples=${windowSamples.size} @ 50Hz")
         }
     }
 
     override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
 
-    // ===== 작은 유틸들 =====
-    private fun pushFixed(q: ArrayDeque<FloatArray>, v: FloatArray, maxLen: Int) {
-        q.addLast(v); while (q.size > maxLen) q.removeFirst()
-    }
 
-    private fun pushFixedInt(q: ArrayDeque<Int>, v: Int, maxLen: Int) {
-        q.addLast(v); while (q.size > maxLen) q.removeFirst()
-    }
+    // 서버 전송
+    private fun sendWindowToServer(
+        samples: List<FloatArray>,
+        startTimestamp: String,
+        endTimestamp: String
+    ) {
+        val url = BASE_URL + IMU_RAW_PATH
 
-    private fun meanOf(q: ArrayDeque<FloatArray>): FloatArray {
-        val head = q.firstOrNull() ?: return floatArrayOf()
-        val m = FloatArray(head.size)
-        for (a in q) for (i in a.indices) m[i] += a[i]
-        val n = q.size.toFloat()
-        for (i in m.indices) m[i] /= n
-        return m
-    }
-
-    private fun median3(a: Int, b: Int, c: Int): Int {
-        val x = intArrayOf(a, b, c); java.util.Arrays.sort(x); return x[1]
-    }
-
-    private fun processWindow(window: List<FloatArray>) {
-        windowCounter += 1
-        if (window.size < 4) return
-
-        // 1) 원특징 4개 (SVM/ΔSVM)
-        val svm = FloatArray(window.size) { i ->
-            val v = window[i]
-            sqrt(v[0]*v[0] + v[1]*v[1] + v[2]*v[2])
-        }
-        val dsvm = FloatArray(window.size - 1) { i -> abs(svm[i + 1] - svm[i]) }
-
-        val x1 = mean(svm)
-        val x2 = stdPop(svm)
-        val x3 = mean(dsvm)
-        val x4 = stdPop(dsvm)
-        val raw4 = floatArrayOf(x1, x2, x3, x4)
-
-        // 2) 표준화(4)
-        val norm4 = FloatArray(4) { i ->
-            (raw4[i] - mu4[i]) / (if (sigma4[i] == 0f) 1f else sigma4[i])
-        }
-
-        // 3) TFLite 추론
-        val input = arrayOf(norm4)
-        val out = Array(1) { FloatArray(numClasses) }
-        tflite.run(input, out)
-
-        val p = if (MODEL_OUTPUT_IS_PROBS) out[0] else softmax(out[0])
-
-        val p1 = p.getOrElse(0){0f}; val p2 = p.getOrElse(1){0f}
-        val p3c = p.getOrElse(2){0f}; val p4 = p.getOrElse(3){0f}; val p5 = p.getOrElse(4){0f}
-
-        // 피처 게이트
-        val zStd  = if (sigma4[1] != 0f) (x2 - mu4[1]) / sigma4[1] else 0f
-        val zDStd = if (sigma4[3] != 0f) (x4 - mu4[3]) / sigma4[3] else 0f
-        val allowHigh = (abs(zStd) >= GATE_Z_STD) || (abs(zDStd) >= GATE_Z_DSTD)
-
-        val isStatic = (x1 < TH_ACTIVITY) && (x3 < TH_D_ACTIVITY)
-        val isActiveAny = (x2 >= TH_ACTIVE_STD) || (x4 >= TH_ACTIVE_DSTD)
-
-        // 최근 3창 평균 스무딩
-        pushFixed(recentP, floatArrayOf(p1,p2,p3c,p4,p5), 3)
-        pushFixed(recentX, floatArrayOf(x1,x2,x3,x4), 3)
-        val pMean = meanOf(recentP)
-        val xMean = meanOf(recentX)
-        val mp1 = pMean.getOrElse(0){p1}; val mp2 = pMean.getOrElse(1){p2}; val mp3 = pMean.getOrElse(2){p3c}
-        val mx1 = xMean.getOrElse(0){x1}; val mx2 = xMean.getOrElse(1){x2}; val mx4 = xMean.getOrElse(3){x4}
-
-        val maxLow = max(mp1, mp2)
-        val allow3Up   = (mp3 >= TH_P3_UP)   && ((mp3 - maxLow) >= MARGIN_P3_UP)
-        val allow3Down = (mp3 <  TH_P3_DOWN) || ((mp3 - maxLow) <  MARGIN_P3_DOWN)
-
-        // jerk guard
-        val jerkRatio = mx4 / (mx2 + 1e-6f)
-        val isJerkLike = (x4 >= SHAKE_DSTD_HIGH || mx4 >= SHAKE_DSTD_HIGH) &&
-                (x1 <= SHAKE_MEAN_MAX && mx1 <= SHAKE_MEAN_MAX) &&
-                (p3c < P3_STRONG_MIN && mp3 < P3_STRONG_MIN) &&
-                (jerkRatio >= JERK_RATIO_TH)
-
-        // 4·5 최우선
-        var grade: Int? = null
-        when {
-            allowHigh && (p5 >= TH_P5) && ((p5 - p3c) >= MARGIN_P5) -> grade = 5
-            allowHigh && (p4 >= TH_P4) && ((p4 - p3c) >= MARGIN_P4) -> grade = 4
-        }
-
-        if (grade == null) {
-            if (isStatic) {
-                pushFixedInt(recentGradeCand, 1, 3)
-                grade = 1
-            } else {
-                val inModerateBand = (x2 in MOD_STD_MIN..(TH_ACTIVE_STD - 1e-6f)) &&
-                        (x4 in MOD_DSTD_MIN..(TH_ACTIVE_DSTD - 1e-6f))
-
-                if (isJerkLike) {
-                    consec3Cond = 0
-                    consec2Cond += 1
-                    if (consec2Cond >= HYST_DOWN_CONSEC) state23 = 2
-                } else {
-                    if (allow3Up && isActiveAny) {
-                        consec3Cond += 1; consec2Cond = 0
-                        if (consec3Cond >= HYST_UP_CONSEC) state23 = 3
-                    } else if (allow3Down || inModerateBand) {
-                        consec2Cond += 1; consec3Cond = 0
-                        if (consec2Cond >= HYST_DOWN_CONSEC) state23 = 2
-                    } else {
-                        consec3Cond = 0; consec2Cond = 0
-                    }
+        val samplesArray = JSONArray()
+        for (sample in samples) {
+            samplesArray.put(
+                JSONArray().apply {
+                    put(sample[0].toDouble()) // x
+                    put(sample[1].toDouble()) // y
+                    put(sample[2].toDouble()) // z
                 }
-
-                pushFixedInt(recentGradeCand, state23, 3)
-
-                val gCand = if (recentGradeCand.size == 3) {
-                    val a = recentGradeCand.elementAt(0)
-                    val b = recentGradeCand.elementAt(1)
-                    val c = recentGradeCand.elementAt(2)
-                    median3(a,b,c)
-                } else state23
-
-                grade = min(gCand, 3)
-
-                val strong3 = (mp3 >= STRONG_P3) && ((mp3 - maxLow) >= STRONG_MARGIN_P3)
-                if (grade == 3 && inModerateBand && !strong3) {
-                    grade = 2
-                }
-            }
+            )
         }
 
-        val finalGrade = grade!!
+        val body = JSONObject().apply {
+            put("device_id",       deviceId)
+            put("window_index",    windowCounter)
+            put("start_timestamp", startTimestamp)
+            put("end_timestamp",   endTimestamp)
+            put("sample_rate",     50)
+            put("window_sec",      6)
+            put("samples",         samplesArray)
+        }.toString()
 
-        // === Logcat 출력 ===
-        val probsStr = String.format(Locale.US, "%.3f, %.3f, %.3f, %.3f, %.3f", p1, p2, p3c, p4, p5)
-        val featStr = String.format(
-            Locale.US,
-            "svm_mean=%.3f, svm_std=%.3f, d_svm_mean=%.3f, d_svm_std=%.3f",
-            x1, x2, x3, x4
-        )
-        Log.i(TAG, "window=$windowCounter, grade=$finalGrade, p=[$probsStr], feat=[$featStr]")
+        Log.i(TAG, "IMU POST -> $url | window=$windowCounter | ${samples.size} samples")
+        Log.d(TAG, "IMU POST body preview -> ${body.take(500)}")
 
-        // ===================== 서버 전송 트리거 =====================
-        maybeSendImuAlert(finalGrade)
-        // ================================================================
-
-        // 4) CSV 로그 (기존 유지)
-        val ts = nowTimestampMicros()
-        predictionLogWriter.apply {
-            write("$ts,$windowCounter,$finalGrade,")
-            for (i in 0 until 5) write(String.format(Locale.US, "%.6f,", p.getOrElse(i){0f}))
-            write(String.format(Locale.US, "%.6f,%.6f,%.6f,%.6f\n", x1, x2, x3, x4))
-            flush()
-        }
-
-        // 5) 브로드캐스트
-        sendBroadcast(Intent("com.example.classification_0623.PREDICTION_RESULT").apply {
-            setPackage(packageName)
-            putExtra("prediction", finalGrade - 1) // 0..4
-            putExtra("windowIndex", windowCounter)
-        })
-
-        // 6) 경고 진동 (5일 때)
-        if (finalGrade == 5) {
-            val vibrator = getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                vibrator.vibrate(VibrationEffect.createOneShot(1000, VibrationEffect.DEFAULT_AMPLITUDE))
-            } else {
-                @Suppress("DEPRECATION") vibrator.vibrate(1000)
-            }
-        }
-    }
-
-    // ======== 서버 전송 관련 함수들 ========
-
-    /** grade가 4/5일 때만 서버로 전송 (중복 전송 방지 포함) */
-    private fun maybeSendImuAlert(grade: Int) {
-        if (grade < 4) {
-            // 위험 레벨이 내려가면 상태 리셋해서 다음에 4로 올라갈 때 다시 전송되게
-            if (lastSentLevel >= 4) lastSentLevel = grade
-            return
-        }
-        val nowMs = System.currentTimeMillis()
-        // 3->4 또는 4->5 상승 이벤트면 전송
-        val isEdgeUp = (lastSentLevel < 4) || (grade > lastSentLevel)
-        // 또는 쿨다운 지나면 재전송(원하면)
-        val cooldownPassed = (SEND_COOLDOWN_MS <= 0L) || ((nowMs - lastSentAtMs) >= SEND_COOLDOWN_MS)
-
-        if (isEdgeUp || cooldownPassed) {
-            val isoTs = isoUtcNow()
-            sendImuAlertToServer(ensurePrefixed(deviceId), isoTs, grade)
-            lastSentLevel = grade
-            lastSentAtMs = nowMs
-        }
-    }
-
-    /** POST 호출 */
-    private fun sendImuAlertToServer(deviceId: String, timestampIso: String, level: Int) {
-        val url = BASE_URL + IMU_ALERT_PATH
-        val jsonObj = JSONObject().apply {
-            put("device_id", deviceId)
-            put("timestamp", timestampIso)
-            put("imu_danger_level", level)
-        }
-        val json = jsonObj.toString()
-
-        Log.i(TAG, "IMU POST -> $url")
-        Log.i(TAG, "IMU POST body -> $json")
-
-        val body = json.toRequestBody("application/json; charset=utf-8".toMediaType())
         val req = Request.Builder()
             .url(url)
             .addHeader("Accept", "application/json")
-            .post(body)
+            .post(body.toRequestBody("application/json; charset=utf-8".toMediaType()))
             .build()
 
         httpClient.newCall(req).enqueue(object : Callback {
             override fun onFailure(call: Call, e: IOException) {
-                Log.e(TAG, "IMU alert POST failed: ${e.message}", e)
+                Log.e(TAG, "IMU POST failed: ${e.message}", e)
             }
             override fun onResponse(call: Call, response: Response) {
                 response.use { res ->
                     val respBody = res.body?.string()
-                    Log.e(TAG, "IMU alert response code=${res.code} msg=${res.message} body=$respBody")
+                    Log.d(TAG, "IMU POST response code=${res.code} window=$windowCounter body=$respBody")
                 }
             }
         })
     }
 
-    /** 서버 전송용 ISO 8601 (UTC Z) */
+
+    // 타임스탬프 유틸 - 서버 전송/CSV 공용 ISO 8601 UTC
     private fun isoUtcNow(): String {
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             java.time.OffsetDateTime.now(java.time.ZoneOffset.UTC)
                 .truncatedTo(java.time.temporal.ChronoUnit.MILLIS)
                 .format(java.time.format.DateTimeFormatter.ISO_OFFSET_DATE_TIME)
-            // 예: 2025-08-11T00:42:42.061+00:00
         } else {
             SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSSXXX", Locale.US).apply {
                 timeZone = TimeZone.getTimeZone("UTC")
@@ -558,8 +333,8 @@ class SensorForegroundService : Service(), SensorEventListener {
         }
     }
 
-    // =====================================
 
+    // 포그라운드 알림
     private fun createNotification() {
         val channelId = "sensor_channel"
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -568,94 +343,15 @@ class SensorForegroundService : Service(), SensorEventListener {
         }
         val notification: Notification = NotificationCompat.Builder(this, channelId)
             .setContentTitle("IMU 수집 중")
-            .setContentText("센서 데이터를 기반으로 분류 예측 중입니다.")
+            .setContentText("가속도 데이터를 서버로 전송 중입니다.")
             .setSmallIcon(R.drawable.ic_launcher_foreground)
             .build()
         startForeground(1, notification)
     }
-
-    // ==== JSON 로더 ==== (스케일러만 유지)
-    private fun loadScalerFromAssets(fileName: String) {
-        val text = assets.open(fileName).bufferedReader().use { it.readText() }
-        val obj = JSONObject(text)
-        fun getArr(vararg keys: String): FloatArray {
-            for (k in keys) if (obj.has(k)) return jaToFloatArray(obj.getJSONArray(k))
-            throw RuntimeException("Missing keys: ${keys.joinToString()}")
-        }
-        mu4 = getArr("mean_", "mean")
-        sigma4 = getArr("scale_", "scale")
-    }
-
-    private fun jaToFloatArray(ja: JSONArray): FloatArray {
-        val out = FloatArray(ja.length())
-        for (i in 0 until ja.length()) out[i] = ja.getDouble(i).toFloat()
-        return out
-    }
-
-    // ==== TFLite 로더 ====
-    private fun initTfliteFromAssets(modelName: String) {
-        val mbb = try {
-            val fd = assets.openFd(modelName)
-            FileInputStream(fd.fileDescriptor).use { fis ->
-                fis.channel.map(FileChannel.MapMode.READ_ONLY, fd.startOffset, fd.declaredLength)
-            }
-        } catch (_: Exception) {
-            val bytes = assets.open(modelName).use { it.readBytes() }
-            java.nio.ByteBuffer.allocateDirect(bytes.size).apply {
-                order(java.nio.ByteOrder.nativeOrder())
-                put(bytes)
-                rewind()
-            }
-        }
-
-        val opts = Interpreter.Options().apply {
-            setUseXNNPACK(true)
-            setNumThreads(Runtime.getRuntime().availableProcessors().coerceAtMost(4))
-        }
-        tflite = Interpreter(mbb, opts)
-    }
-
-    // ==== 수학 유틸 ====
-    private fun softmax(logits: FloatArray): FloatArray {
-        val m = logits.maxOrNull() ?: 0f
-        var sum = 0f
-        val exps = FloatArray(logits.size)
-        for (i in logits.indices) {
-            val e = exp((logits[i] - m).toDouble()).toFloat()
-            exps[i] = e; sum += e
-        }
-        for (i in exps.indices) exps[i] /= if (sum == 0f) 1f else sum
-        return exps
-    }
-
-    private fun mean(a: FloatArray): Float {
-        var s = 0.0
-        for (v in a) s += v
-        return (s / a.size).toFloat()
-    }
-
-    private fun stdPop(a: FloatArray): Float {
-        if (a.isEmpty()) return 0f
-        val m = mean(a)
-        var acc = 0.0
-        for (v in a) {
-            val d = v - m
-            acc += (d * d)
-        }
-        return sqrt((acc / a.size).toFloat())
-    }
-
-    /** CSV 로그용(기존 유지): ISO가 아님 */
-    private fun nowTimestampMicros(): String {
-        val us = baseWallMs * 1000L + (System.nanoTime() - baseNano) / 1000L
-        val ms = us / 1000L
-        val microsRemainder = (us % 1000L).toInt()
-        val base = sdfMillis.format(Date(ms))
-        return String.format("%s%03d", base, microsRemainder)
-    }
 }
 
-/** 선형 위상 FIR를 이용해 3축을 동시에 2:1 디시메이션하는 간단 클래스 */
+
+// FIR 디시메이터
 private class FirDecimator3D(
     private val h: FloatArray,
     private val M: Int
@@ -664,7 +360,7 @@ private class FirDecimator3D(
     private val xb = FloatArray(L)
     private val yb = FloatArray(L)
     private val zb = FloatArray(L)
-    private var idx = 0
+    private var idx     = 0
     private var inCount = 0
 
     fun process(x: Float, y: Float, z: Float): FloatArray? {
