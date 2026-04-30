@@ -24,14 +24,14 @@ class GeoReporter(
 
     private val uploader = GeoAlertUploader(httpClient, baseUrl, path)
 
-    // ✅ 최신 위치 캐시를 계속 갱신(1분마다). 실제 “기록/전송”은 tick에서만.
+    // 최신 위치 캐시를 계속 갱신(4분마다). 실제 “기록/전송”은 tick에서만.
     private val tracker = GeoLocationTracker(
         context = context,
         priority = com.google.android.gms.location.Priority.PRIORITY_HIGH_ACCURACY,
-        updateIntervalMs = 60_000L
+        updateIntervalMs = 240_000L
     )
 
-    // ✅ 오프라인 큐 파일 (jsonl)
+    // 오프라인 큐 파일 (jsonl)
     private val queueFile = File(context.filesDir, "geo_queue.jsonl")
 
     private val ioExec = Executors.newSingleThreadExecutor()
@@ -57,7 +57,7 @@ class GeoReporter(
         tickThread = HandlerThread("geo_tick_thread").apply { start() }
         tickHandler = Handler(tickThread!!.looper)
 
-        // ✅ 시작하자마자 한번 찍고(테스트/즉시성), 이후 5분마다
+        // 시작하자마자 한번 찍고(테스트/즉시성), 이후 5분마다
         tickHandler?.post(tickRunnable)
 
         Log.i(TAG, "started interval=${intervalMs}ms")
@@ -74,12 +74,7 @@ class GeoReporter(
         Log.i(TAG, "stopped")
     }
 
-    /**
-     * ✅ 5분마다 딱 1번만 기록
-     * 1) 최근 2분 이내 캐시 있으면 사용
-     * 2) 없으면 one-shot 시도
-     * 3) 값 있으면 큐에 저장하고 flush(재전송)
-     */
+
     private fun tickOnce() {
         val cached: Location? = tracker.getCachedIfFresh(2 * 60_000L)
         if (cached != null) {
@@ -123,13 +118,7 @@ class GeoReporter(
         }
     }
 
-    /**
-     * ✅ uploadStoredLocations() 개선 버전
-     * - 파일 전체를 읽고
-     * - 성공한 라인은 제거
-     * - 실패한 라인만 남기고 다시 파일에 씀
-     * => 네트워크가 끊겨도 누락 없이 “결국 다 올라가게” 됨
-     */
+
     private fun flushQueueAsync() {
         if (!flushing.compareAndSet(false, true)) return
 

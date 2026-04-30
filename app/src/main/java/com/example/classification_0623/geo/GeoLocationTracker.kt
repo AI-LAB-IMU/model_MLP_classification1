@@ -12,7 +12,7 @@ import com.google.android.gms.location.*
 class GeoLocationTracker(
     private val context: Context,
     private val priority: Int = Priority.PRIORITY_HIGH_ACCURACY,
-    private val updateIntervalMs: Long = 60_000L, // 캐시 갱신용(1분). tick은 GeoReporter가 5분 보장.
+    private val updateIntervalMs: Long = 240_000L, // 캐시 갱신용(4분). tick은 GeoReporter가 5분 보장.
 ) {
     private val TAG = "GeoLocationTracker"
     private val client: FusedLocationProviderClient =
