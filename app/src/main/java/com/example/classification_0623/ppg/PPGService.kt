@@ -45,6 +45,7 @@ class PPGService : Service() {
         private const val NOTI_ID = 1001
         private const val WINDOW_MS = 12_000L
         private const val ENDPOINT = "http://210.125.91.90:8000/api/ingest/"
+        private const val ENDPOINT_APNEA = "http://210.125.91.90:8000/apnea/api/ingest/"
 
         const val ACTION_PPG_UPDATE = "PPG_UPDATE"
         const val EXTRA_ELAPSED_SECS = "elapsed_seconds"
@@ -56,6 +57,8 @@ class PPGService : Service() {
     private lateinit var fileStreamer: FileStreamer
     private lateinit var batchBuffer: BatchBuffer
     private lateinit var uploader: HttpUploader
+    private lateinit var uploaderApnea: HttpUploader
+
     private lateinit var scope: CoroutineScope
 
     private var uploadJob: Job? = null
@@ -95,6 +98,7 @@ class PPGService : Service() {
         fileStreamer = FileStreamer(this)
         batchBuffer = BatchBuffer()
         uploader = HttpUploader(ENDPOINT)
+        uploaderApnea = HttpUploader(ENDPOINT_APNEA)
         scope = CoroutineScope(Dispatchers.IO)
 
         deviceId = buildDeviceId()
@@ -210,14 +214,21 @@ class PPGService : Service() {
                 )
                 chunkCount += 1
                 sendUiUpdate()
+//
+//                try {
+//                    uploader.upload(payload)
+//
+//                    Log.i(TAG, "업로드 성공: $isoTs (g=${g.size}, i=${i.size}, r=${r.size}) · chunk=${chunkCount}")
+//
+//                } catch (e: Exception) {
+//                    Log.e(TAG, "업로드 실패: $isoTs",e)
+//                }
 
                 try {
-                    uploader.upload(payload)
-
-                    Log.i(TAG, "업로드 성공: $isoTs (g=${g.size}, i=${i.size}, r=${r.size}) · chunk=${chunkCount}")
-
+                    uploaderApnea.upload(payload)
+                    Log.i(TAG, "Apnea 업로드 성공: $isoTs")
                 } catch (e: Exception) {
-                    Log.e(TAG, "업로드 실패: $isoTs",e)
+                    Log.e(TAG, "Apnea 업로드 실패: $isoTs", e)
                 }
             }
         }
