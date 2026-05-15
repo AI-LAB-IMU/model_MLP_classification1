@@ -47,21 +47,27 @@ class SensorForegroundService : Service(), SensorEventListener {
     private lateinit var sensorManager: SensorManager
     private var accelerometer: Sensor? = null
 
-    // 윈도우/슬라이드 설정
-    // 100Hz → FIR 디시메이션 → 50Hz
-    // windowSize = 300샘플 = 6초 @ 50Hz
-    // slideSize  = 150샘플 = 3초 @ 50Hz  (50% overlap, 3초마다 전송)
+    // ===================== IMU 윈도우/슬라이드 설정 =====================
+    // 센서 요청 주기: 50Hz
+    // FIR AA 필터 + 2:1 디시메이션 → 최종 25Hz
+    //
+    // windowSize = 300샘플 = 12초 @ 25Hz
+    // slideSize  = 150샘플 = 6초 @ 25Hz
+    //
+    // 즉, 12초 윈도우를 만들고 6초씩 밀어서 전송
+    // => 50% overlap
     private val windowSize = 300
     private val slideSize  = 150
 
-    // FIR 디시메이션 후 50Hz 샘플 버퍼 (x, y, z)
+    // FIR 디시메이션 후 25Hz 샘플 버퍼 (x, y, z)
     private val buffer          = mutableListOf<FloatArray>()
-    // 각 50Hz 샘플의 타임스탬프 버퍼 (start/end 추출용)
+
+    // 각 25Hz 샘플의 타임스탬프 버퍼 (start/end 추출용)
     private val timestampBuffer = mutableListOf<String>()
 
     private var windowCounter = 0
 
-    // 100→50 Hz AA FIR + 2:1 디시메이터
+    // 50Hz → 25Hz AA FIR + 2:1 디시메이터
     private val HB_TAPS = floatArrayOf(
         0.00010228f, -0.00012024f, -0.00024596f, 0.00011137f, 0.00045327f, -0.00000000f, -0.00069560f, -0.00026395f,
         0.00091269f, 0.00071509f, -0.00101310f, -0.00135490f, 0.00088289f, 0.00213500f, -0.00040322f, -0.00294544f,
@@ -76,6 +82,7 @@ class SensorForegroundService : Service(), SensorEventListener {
         -0.00101310f, 0.00071509f, 0.00091269f, -0.00026395f, -0.00069560f, -0.00000000f, 0.00045327f, 0.00011137f,
         -0.00024596f, -0.00012024f, 0.00010228f
     )
+
     private lateinit var decimator: FirDecimator3D
 
     // ===================== 서버 연동 설정 =====================
@@ -99,7 +106,6 @@ class SensorForegroundService : Service(), SensorEventListener {
     // CSV 로그
     private lateinit var rawLogFile:   File
     private lateinit var rawLogWriter: BufferedWriter
-
 
     // device_id 유틸
     private fun normalizedModel(): String {
@@ -127,7 +133,6 @@ class SensorForegroundService : Service(), SensorEventListener {
         return id
     }
 
-
     // 위치/GPS 디버그 유틸
     private fun hasLocationPerm(): Boolean {
         val fine   = ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION)   == PackageManager.PERMISSION_GRANTED
@@ -145,7 +150,6 @@ class SensorForegroundService : Service(), SensorEventListener {
                     lm.isProviderEnabled(android.location.LocationManager.NETWORK_PROVIDER)
         }
     }
-
 
     override fun onCreate() {
         super.onCreate()
@@ -167,14 +171,21 @@ class SensorForegroundService : Service(), SensorEventListener {
             timestampProvider = { isoUtcNow() }
         )
 
-        // 센서 (100Hz)
+        // ===================== IMU 센서 등록 =====================
+        // 50Hz로 센서 데이터를 요청한다.
+        // Android SensorManager의 samplingPeriodUs는 마이크로초 단위.
+        // 20,000us = 0.02초 = 50Hz
+        //
+        // 이후 FirDecimator3D에서 2:1 디시메이션을 적용해서
+        // 최종 25Hz IMU 샘플만 버퍼에 저장한다.
         sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
         accelerometer = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
         accelerometer?.let {
-            sensorManager.registerListener(this, it, 10_000, 0)
+            sensorManager.registerListener(this, it, 20_000, 0)
         }
 
         // FIR 디시메이터 초기화
+        // 입력 50Hz → 출력 25Hz
         decimator = FirDecimator3D(HB_TAPS, 2)
 
         // CSV 로그
@@ -192,10 +203,15 @@ class SensorForegroundService : Service(), SensorEventListener {
         val raw = intent?.getStringExtra("device_id") ?: getOrCreateDeviceIdInService()
         deviceId = ensurePrefixed(raw)
         getSharedPreferences("app_prefs", MODE_PRIVATE)
-            .edit().putString("device_id", deviceId).apply()
+            .edit()
+            .putString("device_id", deviceId)
+            .apply()
 
         Log.i(TAG, "onStartCommand device_id=$deviceId")
-        Log.i(TAG, "GEO debug: geoReporterNull=${geoReporter == null}, geoStarted=$geoStarted, perm=${hasLocationPerm()}, locEnabled=${isLocationEnabled()}")
+        Log.i(
+            TAG,
+            "GEO debug: geoReporterNull=${geoReporter == null}, geoStarted=$geoStarted, perm=${hasLocationPerm()}, locEnabled=${isLocationEnabled()}"
+        )
 
         if (!geoStarted && geoReporter != null) {
             geoReporter!!.start()
@@ -217,7 +233,11 @@ class SensorForegroundService : Service(), SensorEventListener {
         })
 
         sensorManager.unregisterListener(this)
-        if (::rawLogWriter.isInitialized) runCatching { rawLogWriter.close() }
+
+        if (::rawLogWriter.isInitialized) {
+            runCatching { rawLogWriter.close() }
+        }
+
         stopForeground(true)
 
         Log.d(TAG, "Service destroyed")
@@ -225,8 +245,7 @@ class SensorForegroundService : Service(), SensorEventListener {
 
     override fun onBind(intent: Intent?): IBinder? = null
 
-
-    // imu 센서 이벤트
+    // ===================== IMU 센서 이벤트 =====================
     override fun onSensorChanged(event: SensorEvent?) {
         if (event?.sensor?.type != Sensor.TYPE_ACCELEROMETER) return
 
@@ -234,20 +253,21 @@ class SensorForegroundService : Service(), SensorEventListener {
         val y = event.values[1]
         val z = event.values[2]
 
-        // 100Hz → FIR AA 필터 → 50Hz 디시메이션
+        // 50Hz → FIR AA 필터 → 25Hz 디시메이션
         val out = decimator.process(x, y, z) ?: return
 
         val ts = isoUtcNow()
 
-        // CSV 로컬 기록 (50Hz 기준)
+        // CSV 로컬 기록 (25Hz 기준)
         rawLogWriter.write("$ts,${out[0]},${out[1]},${out[2]}\n")
         rawLogWriter.flush()
 
-        // 50Hz 버퍼에 누적
+        // 25Hz 버퍼에 누적
         buffer.add(out)
         timestampBuffer.add(ts)
 
-        // 300샘플(6초) 도달 시 윈도우 전송
+        // 300샘플 도달 시 윈도우 전송
+        // 300 samples @ 25Hz = 12초
         if (buffer.size >= windowSize) {
             windowCounter++
 
@@ -257,18 +277,22 @@ class SensorForegroundService : Service(), SensorEventListener {
 
             sendWindowToServer(windowSamples, startTs, endTs)
 
-            // 150샘플(3초) 슬라이드
+            // 150샘플만 제거
+            // 150 samples @ 25Hz = 6초
+            // 즉, 12초 윈도우에서 6초를 겹치게 유지하므로 50% overlap
             buffer.subList(0, slideSize).clear()
             timestampBuffer.subList(0, slideSize).clear()
 
-            Log.d(TAG, "window=$windowCounter sent | samples=${windowSamples.size} @ 50Hz")
+            Log.d(
+                TAG,
+                "window=$windowCounter sent | samples=${windowSamples.size} @ 25Hz | window=12s | overlap=50% | slide=6s"
+            )
         }
     }
 
     override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
 
-
-    // 서버 전송
+    // ===================== 서버 전송 =====================
     private fun sendWindowToServer(
         samples: List<FloatArray>,
         startTimestamp: String,
@@ -292,12 +316,19 @@ class SensorForegroundService : Service(), SensorEventListener {
             put("window_index",    windowCounter)
             put("start_timestamp", startTimestamp)
             put("end_timestamp",   endTimestamp)
-            put("sample_rate",     50)
-            put("window_sec",      6)
+
+            // 최종 서버 전송 기준:
+            // 25Hz, 12초, 300 samples
+            put("sample_rate",     25)
+            put("window_sec",      12)
+
             put("samples",         samplesArray)
         }.toString()
 
-        Log.i(TAG, "IMU POST -> $url | window=$windowCounter | ${samples.size} samples")
+        Log.i(
+            TAG,
+            "IMU POST -> $url | window=$windowCounter | ${samples.size} samples | 25Hz | 12s | 50% overlap"
+        )
         Log.d(TAG, "IMU POST body preview -> ${body.take(500)}")
 
         val req = Request.Builder()
@@ -313,14 +344,17 @@ class SensorForegroundService : Service(), SensorEventListener {
             override fun onResponse(call: Call, response: Response) {
                 response.use { res ->
                     val respBody = res.body?.string()
-                    Log.d(TAG, "IMU POST response code=${res.code} window=$windowCounter body=$respBody")
+                    Log.d(
+                        TAG,
+                        "IMU POST response code=${res.code} window=$windowCounter body=$respBody"
+                    )
                 }
             }
         })
     }
 
-
-    // 타임스탬프 유틸 - 서버 전송/CSV 공용 ISO 8601 UTC
+    // ===================== 타임스탬프 유틸 =====================
+    // 서버 전송/CSV 공용 ISO 8601 UTC
     private fun isoUtcNow(): String {
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             java.time.OffsetDateTime.now(java.time.ZoneOffset.UTC)
@@ -333,12 +367,15 @@ class SensorForegroundService : Service(), SensorEventListener {
         }
     }
 
-
-    // 포그라운드 알림
+    // ===================== 포그라운드 알림 =====================
     private fun createNotification() {
         val channelId = "sensor_channel"
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(channelId, "Sensor Service", NotificationManager.IMPORTANCE_LOW)
+            val channel = NotificationChannel(
+                channelId,
+                "Sensor Service",
+                NotificationManager.IMPORTANCE_LOW
+            )
             getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
         }
         val notification: Notification = NotificationCompat.Builder(this, channelId)
@@ -350,8 +387,7 @@ class SensorForegroundService : Service(), SensorEventListener {
     }
 }
 
-
-// FIR 디시메이터
+// ===================== FIR 디시메이터 =====================
 private class FirDecimator3D(
     private val h: FloatArray,
     private val M: Int
@@ -364,14 +400,20 @@ private class FirDecimator3D(
     private var inCount = 0
 
     fun process(x: Float, y: Float, z: Float): FloatArray? {
-        xb[idx] = x; yb[idx] = y; zb[idx] = z
+        xb[idx] = x
+        yb[idx] = y
+        zb[idx] = z
+
         idx = (idx + 1) % L
         inCount++
 
         if (inCount < L) return null
         if (((inCount - L) % M) != 0) return null
 
-        var sx = 0f; var sy = 0f; var sz = 0f
+        var sx = 0f
+        var sy = 0f
+        var sz = 0f
+
         var p = idx
         for (k in 0 until L) {
             p = if (p == 0) L - 1 else p - 1
