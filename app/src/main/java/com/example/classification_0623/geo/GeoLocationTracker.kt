@@ -25,9 +25,16 @@ class GeoLocationTracker(
     @Volatile private var latestAtMs: Long = 0L
 
     private fun hasPermission(): Boolean {
-        val fine = ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION)
-        val coarse = ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_COARSE_LOCATION)
-        return (fine == PackageManager.PERMISSION_GRANTED || coarse == PackageManager.PERMISSION_GRANTED)
+        val fine = ContextCompat.checkSelfPermission(
+            context,
+            Manifest.permission.ACCESS_FINE_LOCATION
+        )
+        val coarse = ContextCompat.checkSelfPermission(
+            context,
+            Manifest.permission.ACCESS_COARSE_LOCATION
+        )
+        return fine == PackageManager.PERMISSION_GRANTED ||
+                coarse == PackageManager.PERMISSION_GRANTED
     }
 
     fun start() {
@@ -37,7 +44,9 @@ class GeoLocationTracker(
         }
         if (callback != null) return
 
-        handlerThread = HandlerThread("geo_location_thread").apply { start() }
+        handlerThread = HandlerThread("geo_location_thread").apply {
+            start()
+        }
 
         val request = LocationRequest.Builder(priority, updateIntervalMs)
             .setMinUpdateIntervalMillis(updateIntervalMs / 2)
@@ -48,9 +57,14 @@ class GeoLocationTracker(
         callback = object : LocationCallback() {
             override fun onLocationResult(result: LocationResult) {
                 val loc = result.lastLocation ?: return
+
                 latestLoc = loc
                 latestAtMs = System.currentTimeMillis()
-                Log.d(TAG, "cache updated lat=${loc.latitude} lon=${loc.longitude}")
+
+                Log.d(
+                    TAG,
+                    "cache updated lat=${loc.latitude} lon=${loc.longitude}"
+                )
             }
         }
 
@@ -60,41 +74,69 @@ class GeoLocationTracker(
                 callback!!,
                 handlerThread!!.looper
             )
-            Log.i(TAG, "started updates interval=$updateIntervalMs ms priority=$priority")
+
+            Log.i(
+                TAG,
+                "started updates interval=$updateIntervalMs ms priority=$priority"
+            )
         } catch (se: SecurityException) {
             Log.e(TAG, "SecurityException: ${se.message}", se)
         }
     }
 
     fun stop() {
-        callback?.let { client.removeLocationUpdates(it) }
+        callback?.let {
+            client.removeLocationUpdates(it)
+        }
+
         callback = null
         handlerThread?.quitSafely()
         handlerThread = null
+
         Log.i(TAG, "stopped")
     }
 
-    /** 최근 maxAgeMs 이내 캐시가 있으면 반환 */
+    /**
+     * 최근 maxAgeMs 이내 캐시가 있으면 반환.
+     * 캐시가 없거나 오래됐으면 null 반환.
+     */
     fun getCachedIfFresh(maxAgeMs: Long): Location? {
         val loc = latestLoc ?: return null
         val age = System.currentTimeMillis() - latestAtMs
-        return if (age <= maxAgeMs) loc else null
+
+        return if (age <= maxAgeMs) {
+            loc
+        } else {
+            null
+        }
     }
 
-    /** 캐시가 없을 때 1회 one-shot */
+    /**
+     * 캐시가 없을 때 현재 위치 1회 요청.
+     * 실패하거나 권한이 없으면 null 반환.
+     */
     fun getCurrentOnce(onResult: (Location?) -> Unit) {
         if (!hasPermission()) {
+            Log.w(TAG, "getCurrentOnce: permission not granted.")
             onResult(null)
             return
         }
+
         try {
             client.getCurrentLocation(priority, null)
                 .addOnSuccessListener { loc ->
                     if (loc != null) {
                         latestLoc = loc
                         latestAtMs = System.currentTimeMillis()
-                        Log.d(TAG, "one-shot lat=${loc.latitude} lon=${loc.longitude}")
+
+                        Log.d(
+                            TAG,
+                            "one-shot lat=${loc.latitude} lon=${loc.longitude}"
+                        )
+                    } else {
+                        Log.w(TAG, "one-shot returned null location.")
                     }
+
                     onResult(loc)
                 }
                 .addOnFailureListener { e ->

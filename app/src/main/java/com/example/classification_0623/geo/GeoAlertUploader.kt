@@ -17,16 +17,17 @@ class GeoAlertUploader(
     private val jsonMedia = "application/json; charset=utf-8".toMediaType()
 
     /**
-     * 동기 전송 (백그라운드 스레드에서만 호출!)
-     * 성공(2xx)이면 true
+     * 동기 전송.
+     * 반드시 백그라운드 스레드에서만 호출해야 함.
+     * 성공 응답이 2xx이면 true 반환.
      */
     fun sendSync(event: GeoEvent): Boolean {
         val url = baseUrl + path
         val bodyJson = JSONObject().apply {
             put("device_id", event.deviceId)
             put("timestamp", event.timestampIso)
-            put("latitude", event.latitude)
-            put("longitude", event.longitude)
+            put("latitude", event.latitude ?: JSONObject.NULL)
+            put("longitude", event.longitude ?: JSONObject.NULL)
         }.toString()
 
         Log.i(TAG, "GEO POST -> $url")
@@ -41,7 +42,10 @@ class GeoAlertUploader(
         return try {
             httpClient.newCall(req).execute().use { res ->
                 val respBody = res.body?.string()
-                Log.i(TAG, "GEO resp code=${res.code} msg=${res.message} body=$respBody")
+                Log.i(
+                    TAG,
+                    "GEO resp code=${res.code} msg=${res.message} body=$respBody"
+                )
                 res.isSuccessful
             }
         } catch (e: IOException) {
