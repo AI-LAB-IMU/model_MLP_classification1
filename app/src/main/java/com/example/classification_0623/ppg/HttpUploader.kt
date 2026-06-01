@@ -6,6 +6,8 @@ import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import android.util.Log
+import java.time.Instant
 import okhttp3.RequestBody.Companion.toRequestBody
 import java.util.concurrent.TimeUnit
 
@@ -31,8 +33,18 @@ class HttpUploader (private val endpointUrl: String) {
         val body = json.toRequestBody("application/json; charset=utf-8".toMediaType())
         val req = Request.Builder().url(endpointUrl).post(body).build()
 
+        val requestStartMs = System.currentTimeMillis()
+        Log.i("HttpUploader", "[HTTP_REQUEST_START] ${Instant.ofEpochMilli(requestStartMs)} url=$endpointUrl bytes=${json.toByteArray().size}")
+
         client.newCall(req).execute().use { resp ->
+            val responseAtMs = System.currentTimeMillis()
             val respBody = resp.body?.string()
+
+            Log.i(
+                "HttpUploader",
+                "[HTTP_RESPONSE] ${Instant.ofEpochMilli(responseAtMs)} code=${resp.code} elapsed=${responseAtMs - requestStartMs}ms body=$respBody"
+            )
+
             if (!resp.isSuccessful) {
                 throw RuntimeException("HTTP ${resp.code}: ${resp.message} | body=${respBody}")
             }
